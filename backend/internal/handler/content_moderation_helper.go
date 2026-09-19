@@ -84,8 +84,12 @@ func runContentModeration(c *gin.Context, reqLog *zap.Logger, svc *service.Conte
 }
 
 func buildContentModerationInput(c *gin.Context, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol string, model string, body []byte) service.ContentModerationCheckInput {
+	sessionID := strings.TrimSpace(c.GetHeader("x-opencode-session"))
+	if sessionID == "" {
+		sessionID = service.ExtractClientSessionID(c)
+	}
 	input := service.ContentModerationCheckInput{
-		AuditSessionID: strings.TrimSpace(c.GetHeader("x-opencode-session")),
+		AuditSessionID: sessionID,
 		RequestID:      contentModerationRequestID(c.Request.Context()),
 		UserID:         subject.UserID,
 		Endpoint:       GetInboundEndpoint(c),
