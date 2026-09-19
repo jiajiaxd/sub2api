@@ -307,27 +307,45 @@ type ContentModerationModelFilter struct {
 }
 
 type ContentModerationCheckInput struct {
-	RequestID  string
-	UserID     int64
-	UserEmail  string
-	APIKeyID   int64
-	APIKeyName string
-	GroupID    *int64
-	GroupName  string
-	Endpoint   string
-	Provider   string
-	Model      string
-	Protocol   string
-	Body       []byte
+	AuditSessionID string
+	RequestID      string
+	UserID         int64
+	UserEmail      string
+	APIKeyID       int64
+	APIKeyName     string
+	GroupID        *int64
+	GroupName      string
+	Endpoint       string
+	Provider       string
+	Model          string
+	Protocol       string
+	Body           []byte
+}
+
+// externalAuditRequest is an internal sidecar contract, not an OpenAI field.
+// Session/tenant are authenticated transport metadata, never extracted from input text.
+type externalAuditRequest struct {
+	Protocol  string          `json:"protocol"`
+	Body      json.RawMessage `json:"body"`
+	SessionID string          `json:"-"`
+	Tenant    string          `json:"-"`
 }
 
 type ContentModerationInput struct {
-	Text   string
-	Images []string
+	ExternalAudit *externalAuditRequest
+	Text          string
+	Images        []string
 }
 
 func (in *ContentModerationInput) Normalize() {
 	if in == nil {
+		return
+	}
+	if in.ExternalAudit != nil {
+		// The raw envelope must NOT go through trimRunes or whitespace normalization.
+		// Node selects the current turn before any model sees it.
+		in.Text = "[external audit request]"
+		in.Images = nil
 		return
 	}
 	in.Text = trimRunes(normalizeContentModerationText(in.Text), maxModerationInputRunes)
@@ -335,10 +353,16 @@ func (in *ContentModerationInput) Normalize() {
 }
 
 func (in ContentModerationInput) IsEmpty() bool {
+	if in.ExternalAudit != nil {
+		return len(in.ExternalAudit.Body) == 0
+	}
 	return strings.TrimSpace(in.Text) == "" && len(in.Images) == 0
 }
 
 func (in ContentModerationInput) ModerationInput() any {
+	if in.ExternalAudit != nil {
+		return in.ExternalAudit
+	}
 	images := limitContentModerationImages(in.Images)
 	if len(images) == 0 {
 		return in.Text
@@ -361,6 +385,18 @@ func (in ContentModerationInput) ExcerptText() string {
 }
 
 func (in ContentModerationInput) Hash() string {
+	if in.ExternalAudit != nil {
+		// Avoid collisions caused by the display placeholder or 12000-rune clipping.
+		// Disable pre-hash blocking when changing policy/threshold/model semantics.
+		meta, _ := json.Marshal([]string{
+			"external-audit-v1", in.ExternalAudit.Tenant,
+			in.ExternalAudit.SessionID, in.ExternalAudit.Protocol,
+		})
+		h := sha256.New()
+		_, _ = h.Write(meta)
+		_, _ = h.Write(in.ExternalAudit.Body)
+		return hex.EncodeToString(h.Sum(nil))
+	}
 	h := sha256.New()
 	_, _ = h.Write([]byte("text:"))
 	_, _ = h.Write([]byte(in.Text))
@@ -909,7 +945,19 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"configured_models", cfg.ModelFilter.Models)
 		return allow, nil
 	}
-	content := ExtractContentModerationInput(input.Protocol, input.Body)
+	var content ContentModerationInput
+	if cfg.Model == "audit-policy-v1" {
+		// Only this explicit alias opts into the sidecar extension.
+		// A copy is required because observe-mode tasks can outlive the HTTP handler.
+		content = ContentModerationInput{ExternalAudit: &externalAuditRequest{
+			Protocol:  input.Protocol,
+			Body:      append(json.RawMessage(nil), input.Body...),
+			SessionID: input.AuditSessionID,
+			Tenant:    fmt.Sprintf("sub2api:user:%d", input.UserID),
+		}}
+	} else {
+		content = ExtractContentModerationInput(input.Protocol, input.Body)
+	}
 	if content.IsEmpty() {
 		slog.Info("content_moderation.skip_empty_input",
 			"user_id", input.UserID,
@@ -1075,6 +1123,15 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 		if cfg.RecordNonHits {
 			log := s.buildLog(input, cfg, ContentModerationActionError, false, "", 0, nil, content.ExcerptText(), &latency, queueDelay, err.Error())
 			_ = s.repo.CreateLog(ctx, log)
+		}
+		if allowBlock && cfg.Model == "audit-policy-v1" && cfg.Mode == ContentModerationModePreBlock {
+			// Operational unavailability is NOT a content violation.
+			return &ContentModerationDecision{
+				Allowed: false, Blocked: true, Flagged: false,
+				Action:     ContentModerationActionError,
+				StatusCode: http.StatusServiceUnavailable,
+				Message:    "内容审核暂不可用，请稍后重试",
+			}
 		}
 		return allow
 	}
@@ -1743,6 +1800,10 @@ func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Conte
 		Model: cfg.Model,
 		Input: input,
 	}
+	if ext, ok := input.(*externalAuditRequest); ok {
+		payload.Input = "[external audit request]"
+		payload.AuditRequest = ext
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -1757,6 +1818,12 @@ func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Conte
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	if ext, ok := input.(*externalAuditRequest); ok {
+		if ext.SessionID != "" {
+			req.Header.Set("x-opencode-session", ext.SessionID)
+		}
+		req.Header.Set("x-audit-tenant", ext.Tenant)
+	}
 
 	client, err := s.moderationHTTPClient(ctx, cfg)
 	if err != nil {
@@ -2658,8 +2725,9 @@ func buildContentModerationTestAuditResult(result *moderationAPIResult, threshol
 }
 
 type moderationAPIRequest struct {
-	Model string `json:"model"`
-	Input any    `json:"input"`
+	Model        string                `json:"model"`
+	Input        any                   `json:"input"`
+	AuditRequest *externalAuditRequest `json:"audit_request,omitempty"`
 }
 
 type moderationAPIInputPart struct {

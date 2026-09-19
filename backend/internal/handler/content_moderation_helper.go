@@ -20,6 +20,9 @@ func contentModerationStatus(decision *service.ContentModerationDecision) int {
 }
 
 func contentModerationErrorCode(decision *service.ContentModerationDecision) string {
+	if decision != nil && decision.Action == service.ContentModerationActionError {
+		return "audit_unavailable"
+	}
 	return "content_policy_violation"
 }
 
@@ -82,13 +85,14 @@ func runContentModeration(c *gin.Context, reqLog *zap.Logger, svc *service.Conte
 
 func buildContentModerationInput(c *gin.Context, apiKey *service.APIKey, subject middleware2.AuthSubject, protocol string, model string, body []byte) service.ContentModerationCheckInput {
 	input := service.ContentModerationCheckInput{
-		RequestID: contentModerationRequestID(c.Request.Context()),
-		UserID:    subject.UserID,
-		Endpoint:  GetInboundEndpoint(c),
-		Provider:  contentModerationProvider(apiKey),
-		Model:     clientRequestedModel(c, model),
-		Protocol:  protocol,
-		Body:      body,
+		AuditSessionID: strings.TrimSpace(c.GetHeader("x-opencode-session")),
+		RequestID:      contentModerationRequestID(c.Request.Context()),
+		UserID:         subject.UserID,
+		Endpoint:       GetInboundEndpoint(c),
+		Provider:       contentModerationProvider(apiKey),
+		Model:          clientRequestedModel(c, model),
+		Protocol:       protocol,
+		Body:           body,
 	}
 	if resolvedPlatform, ok := service.ResolvedTargetPlatformFromContext(c.Request.Context()); ok {
 		input.Provider = resolvedPlatform
