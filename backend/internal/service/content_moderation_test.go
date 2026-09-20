@@ -824,6 +824,108 @@ func TestContentModerationUpdateConfig_AppendsAndDeletesAPIKeys(t *testing.T) {
 	require.Equal(t, []string{"sk-old-b", "sk-new-c"}, saved.apiKeys())
 }
 
+func TestContentModerationWhitelistedUsers(t *testing.T) {
+	for _, mode := range []string{ContentModerationModePreBlock, ContentModerationModeObserve} {
+		t.Run(mode, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{CategoryScores: map[string]float64{"sexual": 0.01}}}})
+			}))
+			defer server.Close()
+
+			cfg := defaultContentModerationConfig()
+			cfg.Enabled = true
+			cfg.Mode = mode
+			cfg.BaseURL = server.URL
+			cfg.APIKeys = []string{"sk-test"}
+			cfg.BlockedKeywords = []string{"secret-token"}
+			cfg.RecordNonHits = true
+			cfg.WhitelistedUserIDs = []int64{42}
+			svc, repo := newContentModerationModelFilterTestService(t, cfg)
+			input := ContentModerationCheckInput{
+				UserID: 42, Protocol: ContentModerationProtocolOpenAIChat,
+				Body: []byte(`{"messages":[{"role":"user","content":"secret-token"}]}`),
+			}
+			decision, err := svc.Check(context.Background(), input)
+			require.NoError(t, err)
+			require.True(t, decision.Allowed)
+			require.False(t, decision.Blocked)
+			require.Zero(t, calls)
+			require.Empty(t, repo.snapshotLogs())
+			input.Body = []byte(`{"messages":[{"role":"user","content":"ordinary text"}]}`)
+			decision, err = svc.Check(context.Background(), input)
+			require.NoError(t, err)
+			require.True(t, decision.Allowed)
+			require.Zero(t, calls)
+			require.Empty(t, repo.snapshotLogs())
+
+			input.UserID = 43
+			input.Body = []byte(`{"messages":[{"role":"user","content":"secret-token"}]}`)
+			decision, err = svc.Check(context.Background(), input)
+			require.NoError(t, err)
+			if mode == ContentModerationModePreBlock {
+				require.True(t, decision.Blocked)
+			} else {
+				require.True(t, decision.Allowed)
+			}
+		})
+	}
+}
+
+func TestContentModerationWhitelistedUsersConfigRoundTrip(t *testing.T) {
+	repo := &contentModerationTestSettingRepo{values: map[string]string{}}
+	svc := NewContentModerationService(repo, nil, nil, nil, nil, nil, nil, nil)
+	initial, err := svc.GetConfig(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, initial.WhitelistedUserIDs)
+
+	ids := []int64{42, 7, 42, 0, -1}
+	view, err := svc.UpdateConfig(context.Background(), UpdateContentModerationConfigInput{WhitelistedUserIDs: &ids})
+	require.NoError(t, err)
+	require.Equal(t, []int64{7, 42}, view.WhitelistedUserIDs)
+	loaded, err := svc.GetConfig(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, view.WhitelistedUserIDs, loaded.WhitelistedUserIDs)
+
+	view, err = svc.UpdateConfig(context.Background(), UpdateContentModerationConfigInput{})
+	require.NoError(t, err)
+	require.Equal(t, []int64{7, 42}, view.WhitelistedUserIDs)
+	empty := []int64{}
+	view, err = svc.UpdateConfig(context.Background(), UpdateContentModerationConfigInput{WhitelistedUserIDs: &empty})
+	require.NoError(t, err)
+	require.Empty(t, view.WhitelistedUserIDs)
+}
+
+func TestContentModerationWhitelistedUsersUpdateTakesEffectImmediately(t *testing.T) {
+	cfg := defaultContentModerationModelFilterTestConfig()
+	svc, repo := newContentModerationModelFilterTestService(t, cfg)
+	input := ContentModerationCheckInput{
+		UserID: 42, Protocol: ContentModerationProtocolOpenAIChat,
+		Body: []byte(`{"messages":[{"role":"user","content":"secret-token"}]}`),
+	}
+	decision, err := svc.Check(context.Background(), input)
+	require.NoError(t, err)
+	require.True(t, decision.Blocked)
+	requireContentModerationLogCount(t, repo, 1)
+
+	ids := []int64{42}
+	_, err = svc.UpdateConfig(context.Background(), UpdateContentModerationConfigInput{WhitelistedUserIDs: &ids})
+	require.NoError(t, err)
+	decision, err = svc.Check(context.Background(), input)
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.Len(t, repo.snapshotLogs(), 1)
+
+	empty := []int64{}
+	_, err = svc.UpdateConfig(context.Background(), UpdateContentModerationConfigInput{WhitelistedUserIDs: &empty})
+	require.NoError(t, err)
+	decision, err = svc.Check(context.Background(), input)
+	require.NoError(t, err)
+	require.True(t, decision.Blocked)
+	requireContentModerationLogCount(t, repo, 2)
+}
+
 func TestContentModerationUpdateConfig_ReplacesAPIKeysWhenRequested(t *testing.T) {
 	cfg := defaultContentModerationConfig()
 	cfg.APIKeys = []string{"sk-old-a", "sk-old-b"}
