@@ -254,6 +254,8 @@ export default {
       statusFailed: 'Failed to load runtime status',
       enabled: 'Enable Content Moderation',
       enabledHint: 'When off, gateway requests are not moderated even if the menu is enabled.',
+      whitelistedUsers: 'Exempt users',
+      whitelistedUsersHint: 'Selected users bypass content moderation, including keywords, hashes, pre-block checks, and async observation. Separate prompt auditing is unaffected.',
       mode: 'Global Mode',
       modePreBlock: 'Pre-Block',
       modePreBlockDesc: 'Synchronously reviews the latest user input before every request and rejects hits immediately.',

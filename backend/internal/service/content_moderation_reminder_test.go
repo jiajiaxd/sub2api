@@ -113,6 +113,62 @@ func TestContentModerationCheck_ReminderKeywordModes(t *testing.T) {
 	}
 }
 
+func TestContentModerationCheck_SidecarPreservesKeywordCheck(t *testing.T) {
+	type auditCall struct {
+		Model        string                `json:"model"`
+		Input        string                `json:"input"`
+		AuditRequest *externalAuditRequest `json:"audit_request"`
+	}
+	requests := make(chan auditCall, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload auditCall
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requests <- payload
+		_ = json.NewEncoder(w).Encode(moderationAPIResponse{Results: []moderationAPIResult{{}}})
+	}))
+	defer server.Close()
+
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.Model = "audit-policy-v1"
+	cfg.BaseURL = server.URL
+	cfg.APIKeys = []string{"test"}
+	cfg.BlockedKeywords = []string{"今晚打老虎"}
+	cfg.RetryCount = 0
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	svc := NewContentModerationService(&contentModerationTestSettingRepo{values: map[string]string{
+		SettingKeyRiskControlEnabled:      "true",
+		SettingKeyContentModerationConfig: string(raw),
+	}}, &contentModerationTestRepo{}, nil, nil, nil, nil, nil, nil)
+
+	blockedBody := reminderTestBody(t, ContentModerationProtocolAnthropicMessages, []string{"<system-reminder>今晚打老虎</system-reminder>"})
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		UserID: 42, Protocol: ContentModerationProtocolAnthropicMessages, Body: blockedBody,
+	})
+	require.NoError(t, err)
+	require.Equal(t, ContentModerationActionKeywordBlock, decision.Action)
+	require.Empty(t, requests)
+
+	allowedBody := reminderTestBody(t, ContentModerationProtocolAnthropicMessages, []string{"safe text"})
+	decision, err = svc.Check(context.Background(), ContentModerationCheckInput{
+		UserID: 42, Protocol: ContentModerationProtocolAnthropicMessages, Body: allowedBody, AuditSessionID: "session-42",
+	})
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.Len(t, requests, 1)
+	request := <-requests
+	require.Equal(t, "audit-policy-v1", request.Model)
+	require.Equal(t, "[external audit request]", request.Input)
+	require.Equal(t, ContentModerationProtocolAnthropicMessages, request.AuditRequest.Protocol)
+	require.JSONEq(t, string(allowedBody), string(request.AuditRequest.Body))
+}
+
 func TestExtractContentModerationKeywordText_Boundaries(t *testing.T) {
 	for _, tc := range []struct{ protocol, body string }{
 		{ContentModerationProtocolAnthropicMessages, `{"messages":[{"role":"user","content":"old"},{"role":"user","content":[{"type":"tool_result","content":"今晚打老虎"}]}]}`},

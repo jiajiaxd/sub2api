@@ -90,6 +90,7 @@ const baseConfig = (): ContentModerationConfig => ({
   sample_rate: 100,
   all_groups: true,
   group_ids: [],
+  whitelisted_user_ids: [],
   record_non_hits: false,
   worker_count: 4,
   queue_size: 32768,
@@ -369,6 +370,45 @@ describe('admin RiskControlView', () => {
       },
     }))
     expect(showError).not.toHaveBeenCalled()
+  })
+
+  it('saves exempt users selected in the audit scope', async () => {
+    getConfig.mockResolvedValue({ ...baseConfig(), whitelisted_user_ids: [7] })
+    const UserSelectorStub = defineComponent({
+      props: ['modelValue'],
+      emits: ['update:modelValue'],
+      setup(props, { emit }) {
+        return () => h('button', {
+          'data-test': 'add-exempt-user',
+          onClick: () => emit('update:modelValue', [...props.modelValue, 9]),
+        }, String(props.modelValue.join(',')))
+      },
+    })
+    const wrapper = mount(RiskControlView, {
+      global: {
+        stubs: {
+          AppLayout: AppLayoutStub,
+          BaseDialog: BaseDialogStub,
+          Icon: true,
+          Select: true,
+          Toggle: true,
+          Pagination: true,
+          ModelWhitelistSelector: ModelWhitelistSelectorStub,
+          OpenAIFastPolicyUserSelector: UserSelectorStub,
+          ProxySelector: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    await findButtonByText(wrapper, 'admin.riskControl.openSettings').trigger('click')
+    await findButtonByText(wrapper, 'admin.riskControl.tabs.scope').trigger('click')
+    expect(wrapper.get('[data-test="add-exempt-user"]').text()).toBe('7')
+    await wrapper.get('[data-test="add-exempt-user"]').trigger('click')
+    await findButtonByText(wrapper, 'admin.riskControl.saveConfig').trigger('click')
+    await flushPromises()
+
+    expect(updateConfig).toHaveBeenCalledWith(expect.objectContaining({ whitelisted_user_ids: [7, 9] }))
   })
 
   it('submits edited risk control thresholds when saving moderation config', async () => {

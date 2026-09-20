@@ -153,6 +153,7 @@ type ContentModerationConfig struct {
 	SampleRate           int                          `json:"sample_rate"`
 	AllGroups            bool                         `json:"all_groups"`
 	GroupIDs             []int64                      `json:"group_ids"`
+	WhitelistedUserIDs   []int64                      `json:"whitelisted_user_ids"`
 	RecordNonHits        bool                         `json:"record_non_hits"`
 	Thresholds           map[string]float64           `json:"thresholds"`
 	WorkerCount          int                          `json:"worker_count"`
@@ -193,6 +194,7 @@ type ContentModerationConfigView struct {
 	SampleRate                     int                                     `json:"sample_rate"`
 	AllGroups                      bool                                    `json:"all_groups"`
 	GroupIDs                       []int64                                 `json:"group_ids"`
+	WhitelistedUserIDs             []int64                                 `json:"whitelisted_user_ids"`
 	RecordNonHits                  bool                                    `json:"record_non_hits"`
 	Thresholds                     map[string]float64                      `json:"thresholds"`
 	WorkerCount                    int                                     `json:"worker_count"`
@@ -290,6 +292,7 @@ type UpdateContentModerationConfigInput struct {
 	SampleRate                     *int                          `json:"sample_rate"`
 	AllGroups                      *bool                         `json:"all_groups"`
 	GroupIDs                       *[]int64                      `json:"group_ids"`
+	WhitelistedUserIDs             *[]int64                      `json:"whitelisted_user_ids"`
 	RecordNonHits                  *bool                         `json:"record_non_hits"`
 	Thresholds                     *map[string]float64           `json:"thresholds"`
 	WorkerCount                    *int                          `json:"worker_count"`
@@ -316,27 +319,45 @@ type ContentModerationModelFilter struct {
 }
 
 type ContentModerationCheckInput struct {
-	RequestID  string
-	UserID     int64
-	UserEmail  string
-	APIKeyID   int64
-	APIKeyName string
-	GroupID    *int64
-	GroupName  string
-	Endpoint   string
-	Provider   string
-	Model      string
-	Protocol   string
-	Body       []byte
+	AuditSessionID string
+	RequestID      string
+	UserID         int64
+	UserEmail      string
+	APIKeyID       int64
+	APIKeyName     string
+	GroupID        *int64
+	GroupName      string
+	Endpoint       string
+	Provider       string
+	Model          string
+	Protocol       string
+	Body           []byte
+}
+
+// externalAuditRequest is an internal sidecar contract, not an OpenAI field.
+// Session/tenant are authenticated transport metadata, never extracted from input text.
+type externalAuditRequest struct {
+	Protocol  string          `json:"protocol"`
+	Body      json.RawMessage `json:"body"`
+	SessionID string          `json:"-"`
+	Tenant    string          `json:"-"`
 }
 
 type ContentModerationInput struct {
-	Text   string
-	Images []string
+	ExternalAudit *externalAuditRequest
+	Text          string
+	Images        []string
 }
 
 func (in *ContentModerationInput) Normalize() {
 	if in == nil {
+		return
+	}
+	if in.ExternalAudit != nil {
+		// The raw envelope must NOT go through trimRunes or whitespace normalization.
+		// Node selects the current turn before any model sees it.
+		in.Text = "[external audit request]"
+		in.Images = nil
 		return
 	}
 	in.Text = trimRunes(normalizeContentModerationText(in.Text), maxModerationInputRunes)
@@ -344,10 +365,16 @@ func (in *ContentModerationInput) Normalize() {
 }
 
 func (in ContentModerationInput) IsEmpty() bool {
+	if in.ExternalAudit != nil {
+		return len(in.ExternalAudit.Body) == 0
+	}
 	return strings.TrimSpace(in.Text) == "" && len(in.Images) == 0
 }
 
 func (in ContentModerationInput) ModerationInput() any {
+	if in.ExternalAudit != nil {
+		return in.ExternalAudit
+	}
 	images := limitContentModerationImages(in.Images)
 	if len(images) == 0 {
 		return in.Text
@@ -370,6 +397,18 @@ func (in ContentModerationInput) ExcerptText() string {
 }
 
 func (in ContentModerationInput) Hash() string {
+	if in.ExternalAudit != nil {
+		// Avoid collisions caused by the display placeholder or 12000-rune clipping.
+		// Disable pre-hash blocking when changing policy/threshold/model semantics.
+		meta, _ := json.Marshal([]string{
+			"external-audit-v1", in.ExternalAudit.Tenant,
+			in.ExternalAudit.SessionID, in.ExternalAudit.Protocol,
+		})
+		h := sha256.New()
+		_, _ = h.Write(meta)
+		_, _ = h.Write(in.ExternalAudit.Body)
+		return hex.EncodeToString(h.Sum(nil))
+	}
 	h := sha256.New()
 	_, _ = h.Write([]byte("text:"))
 	_, _ = h.Write([]byte(in.Text))
@@ -690,6 +729,9 @@ func (s *ContentModerationService) UpdateConfig(ctx context.Context, input Updat
 	if input.GroupIDs != nil {
 		cfg.GroupIDs = normalizeInt64IDs(*input.GroupIDs)
 	}
+	if input.WhitelistedUserIDs != nil {
+		cfg.WhitelistedUserIDs = normalizeInt64IDs(*input.WhitelistedUserIDs)
+	}
 	if input.RecordNonHits != nil {
 		cfg.RecordNonHits = *input.RecordNonHits
 	}
@@ -880,6 +922,10 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"protocol", input.Protocol)
 		return allow, nil
 	}
+	if input.UserID > 0 && cfg.isWhitelistedUser(input.UserID) {
+		slog.Info("content_moderation.skip_whitelisted_user", "user_id", input.UserID, "endpoint", input.Endpoint)
+		return allow, nil
+	}
 	if !inGroupScope {
 		slog.Info("content_moderation.skip_group_out_of_scope",
 			"user_id", input.UserID,
@@ -946,7 +992,18 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			return allow, nil
 		}
 	}
-	content := ExtractContentModerationInput(input.Protocol, input.Body)
+	var content ContentModerationInput
+	if cfg.Model == "audit-policy-v1" {
+		// Observe-mode tasks can outlive the HTTP handler.
+		content = ContentModerationInput{ExternalAudit: &externalAuditRequest{
+			Protocol:  input.Protocol,
+			Body:      append(json.RawMessage(nil), input.Body...),
+			SessionID: input.AuditSessionID,
+			Tenant:    fmt.Sprintf("sub2api:user:%d", input.UserID),
+		}}
+	} else {
+		content = ExtractContentModerationInput(input.Protocol, input.Body)
+	}
 	if content.IsEmpty() {
 		slog.Info("content_moderation.skip_empty_input",
 			"user_id", input.UserID,
@@ -1074,6 +1131,15 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 			log := s.buildLog(input, cfg, ContentModerationActionError, false, "", 0, nil, content.ExcerptText(), &latency, queueDelay, err.Error())
 			log.EngineMeta = moderationAttemptMeta(cfg, content)
 			_ = s.repo.CreateLog(ctx, log)
+		}
+		if allowBlock && cfg.Model == "audit-policy-v1" && cfg.Mode == ContentModerationModePreBlock {
+			// Operational unavailability is NOT a content violation.
+			return &ContentModerationDecision{
+				Allowed: false, Blocked: true, Flagged: false,
+				Action:     ContentModerationActionError,
+				StatusCode: http.StatusServiceUnavailable,
+				Message:    "内容审核暂不可用，请稍后重试",
+			}
 		}
 		return allow
 	}
@@ -1755,6 +1821,10 @@ func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Conte
 		Model: cfg.Model,
 		Input: input,
 	}
+	if ext, ok := input.(*externalAuditRequest); ok {
+		payload.Input = "[external audit request]"
+		payload.AuditRequest = ext
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -1769,6 +1839,12 @@ func (s *ContentModerationService) callModerationOnceWithInput(ctx context.Conte
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	if ext, ok := input.(*externalAuditRequest); ok {
+		if ext.SessionID != "" {
+			req.Header.Set("x-opencode-session", ext.SessionID)
+		}
+		req.Header.Set("x-audit-tenant", ext.Tenant)
+	}
 
 	client, err := s.moderationHTTPClient(ctx, cfg)
 	if err != nil {
@@ -2099,6 +2175,7 @@ func defaultContentModerationConfig() *ContentModerationConfig {
 		SampleRate:           100,
 		AllGroups:            true,
 		GroupIDs:             []int64{},
+		WhitelistedUserIDs:   []int64{},
 		RecordNonHits:        false,
 		Thresholds:           ContentModerationDefaultThresholds(),
 		WorkerCount:          defaultContentModerationWorkerCount,
@@ -2134,6 +2211,7 @@ func cloneContentModerationConfig(cfg *ContentModerationConfig) *ContentModerati
 	clone.ProxyID = cloneInt64Ptr(cfg.ProxyID)
 	clone.APIKeys = append([]string(nil), cfg.APIKeys...)
 	clone.GroupIDs = append([]int64(nil), cfg.GroupIDs...)
+	clone.WhitelistedUserIDs = append([]int64(nil), cfg.WhitelistedUserIDs...)
 	clone.BlockedKeywords = append([]string(nil), cfg.BlockedKeywords...)
 	clone.Thresholds = cloneFloatMap(cfg.Thresholds)
 	clone.ModelFilter = ContentModerationModelFilter{
@@ -2221,6 +2299,7 @@ func (cfg *ContentModerationConfig) normalize() {
 		cfg.NonHitRetentionDays = maxContentModerationNonHitRetentionDays
 	}
 	cfg.GroupIDs = normalizeInt64IDs(cfg.GroupIDs)
+	cfg.WhitelistedUserIDs = normalizeInt64IDs(cfg.WhitelistedUserIDs)
 	cfg.Thresholds = mergeContentModerationThresholds(ContentModerationDefaultThresholds(), cfg.Thresholds)
 	cfg.BlockedKeywords = normalizeBlockedKeywords(cfg.BlockedKeywords)
 	cfg.KeywordBlockingMode = normalizeKeywordBlockingMode(cfg.KeywordBlockingMode)
@@ -2236,6 +2315,15 @@ func (cfg *ContentModerationConfig) includesGroup(groupID *int64) bool {
 	}
 	for _, id := range cfg.GroupIDs {
 		if id == *groupID {
+			return true
+		}
+	}
+	return false
+}
+
+func (cfg *ContentModerationConfig) isWhitelistedUser(userID int64) bool {
+	for _, id := range cfg.WhitelistedUserIDs {
+		if id == userID {
 			return true
 		}
 	}
@@ -2439,6 +2527,7 @@ func (s *ContentModerationService) configView(cfg *ContentModerationConfig) *Con
 		SampleRate:                     cfg.SampleRate,
 		AllGroups:                      cfg.AllGroups,
 		GroupIDs:                       append([]int64(nil), cfg.GroupIDs...),
+		WhitelistedUserIDs:             append([]int64(nil), cfg.WhitelistedUserIDs...),
 		RecordNonHits:                  cfg.RecordNonHits,
 		Thresholds:                     cloneFloatMap(cfg.Thresholds),
 		WorkerCount:                    cfg.WorkerCount,
@@ -2677,8 +2766,9 @@ func buildContentModerationTestAuditResult(result *moderationAPIResult, threshol
 }
 
 type moderationAPIRequest struct {
-	Model string `json:"model"`
-	Input any    `json:"input"`
+	Model        string                `json:"model"`
+	Input        any                   `json:"input"`
+	AuditRequest *externalAuditRequest `json:"audit_request,omitempty"`
 }
 
 type moderationAPIInputPart struct {

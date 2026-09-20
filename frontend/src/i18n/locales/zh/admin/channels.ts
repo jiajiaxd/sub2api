@@ -254,6 +254,8 @@ export default {
       statusFailed: '加载运行状态失败',
       enabled: '开启内容审计',
       enabledHint: '关闭后即使风控中心菜单启用，也不会审核网关请求。',
+      whitelistedUsers: '免审用户',
+      whitelistedUsersHint: '选中的用户不进行内容审计（包括关键词、Hash、同步拦截和异步观察）；独立的提示词审计不受影响。',
       mode: '全局模式',
       modePreBlock: '前置拦截',
       modePreBlockDesc: '每次请求先同步审核最新用户输入，命中后立即拒绝请求。',
